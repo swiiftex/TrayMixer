@@ -37,17 +37,24 @@ namespace TrayMixer
         public float Peak;
     }
 
+    sealed class DeviceState
+    {
+        public string Id;
+        public string Name;
+        public Level Level;
+        public float Peak;
+        public bool IsDefault;
+    }
+
     sealed class MixerSnapshot
     {
-        public string DeviceName;
-        public Level Master;
-        public float MasterPeak;
+        public readonly List<DeviceState> Devices = new List<DeviceState>();
         public readonly List<AppState> Apps = new List<AppState>();
-        public bool HasDevice => DeviceName != null;
+        public DeviceState DefaultDevice => Devices.Find(d => d.IsDefault);
     }
 
     // Owns all Core Audio objects on a dedicated MTA thread (session notifications are only delivered to MTA clients),
-    // publishes snapshots of the default device and every app's sessions, and restores remembered app volumes when an
+    // publishes snapshots of every output device and every app's sessions, and restores remembered app volumes when an
     // app's audio session is recreated (many apps, Chromium-based ones especially, start at 100% every time).
     sealed class AudioEngine : IDisposable
     {
@@ -71,15 +78,21 @@ namespace TrayMixer
         readonly Dictionary<string, Level> _remembered;
         readonly Dictionary<uint, ProcessDetails> _processes = new Dictionary<uint, ProcessDetails>();
         readonly Dictionary<string, string> _appNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        readonly Dictionary<string, IAudioSessionManager2> _devices = new Dictionary<string, IAudioSessionManager2>();
+        readonly Dictionary<string, Device> _devices = new Dictionary<string, Device>();
         List<Session> _sessions = new List<Session>();
         IMMDeviceEnumerator _enumerator;
         SessionNotifier _sessionNotifier;
         VolumeNotifier _volumeNotifier;
-        string _defaultId, _defaultName;
-        IAudioEndpointVolume _endpointVolume;
-        IAudioMeterInformation _endpointMeter;
+        string _defaultId;
         string _lastSignature;
+
+        sealed class Device
+        {
+            public string Name;
+            public IAudioSessionManager2 Sessions;
+            public IAudioEndpointVolume Volume;
+            public IAudioMeterInformation Meter;
+        }
 
         sealed class Session
         {
@@ -119,7 +132,7 @@ namespace TrayMixer
             }
         }
 
-        public void SetMaster(Level level) => Post(() => ApplyMaster(level));
+        public void SetDevice(string deviceId, Level level) => Post(() => ApplyDevice(deviceId, level));
 
         public void SetApp(string key, Level level) => Post(() => ApplyApp(key, level));
 
@@ -181,12 +194,12 @@ namespace TrayMixer
 
         // ---- Commands ----
 
-        void ApplyMaster(Level level)
+        void ApplyDevice(string deviceId, Level level)
         {
-            if (_endpointVolume == null)
+            if (!_devices.TryGetValue(deviceId, out Device device) || device.Volume == null)
                 return;
-            _endpointVolume.SetMasterVolumeLevelScalar(level.Volume / 100f, ref EventContext);
-            _endpointVolume.SetMute(level.Muted, ref EventContext);
+            device.Volume.SetMasterVolumeLevelScalar(level.Volume / 100f, ref EventContext);
+            device.Volume.SetMute(level.Muted, ref EventContext);
         }
 
         void ApplyApp(string key, Level level)
@@ -248,11 +261,11 @@ namespace TrayMixer
 
             var found = new List<Session>();
             var livePids = new HashSet<uint>();
-            foreach (var device in new List<KeyValuePair<string, IAudioSessionManager2>>(_devices))
+            foreach (var device in new List<KeyValuePair<string, Device>>(_devices))
             {
                 try
                 {
-                    CollectSessions(device.Key, device.Value, found, livePids);
+                    CollectSessions(device.Key, device.Value.Sessions, found, livePids);
                 }
                 catch (COMException)
                 {
@@ -317,14 +330,22 @@ namespace TrayMixer
                         present.Add(id);
                         if (_devices.ContainsKey(id))
                             continue;
-                        var manager = CoreAudio.Activate<IAudioSessionManager2>(device);
-                        if (manager == null)
+                        var sessions = CoreAudio.Activate<IAudioSessionManager2>(device);
+                        if (sessions == null)
                             continue;
                         // The session manager only sends notifications after the session list has been enumerated once.
-                        if (manager.GetSessionEnumerator(out IAudioSessionEnumerator initial) == 0)
+                        if (sessions.GetSessionEnumerator(out IAudioSessionEnumerator initial) == 0)
                             CoreAudio.Release(initial);
-                        manager.RegisterSessionNotification(_sessionNotifier);
-                        _devices[id] = manager;
+                        sessions.RegisterSessionNotification(_sessionNotifier);
+                        var volume = CoreAudio.Activate<IAudioEndpointVolume>(device);
+                        volume?.RegisterControlChangeNotify(_volumeNotifier);
+                        _devices[id] = new Device
+                        {
+                            Name = CoreAudio.GetFriendlyName(device) ?? "Speakers",
+                            Sessions = sessions,
+                            Volume = volume,
+                            Meter = CoreAudio.Activate<IAudioMeterInformation>(device),
+                        };
                     }
                     finally
                     {
@@ -346,50 +367,34 @@ namespace TrayMixer
 
         void DropDevice(string id)
         {
-            var manager = _devices[id];
+            Device device = _devices[id];
             _devices.Remove(id);
-            try { manager.UnregisterSessionNotification(_sessionNotifier); }
+            try { device.Sessions.UnregisterSessionNotification(_sessionNotifier); }
             catch (COMException) { }
-            CoreAudio.Release(manager);
+            if (device.Volume != null)
+            {
+                try { device.Volume.UnregisterControlChangeNotify(_volumeNotifier); }
+                catch (COMException) { }
+            }
+            CoreAudio.Release(device.Sessions);
+            CoreAudio.Release(device.Volume);
+            CoreAudio.Release(device.Meter);
         }
 
         void SyncDefaultDevice()
         {
-            string id = null;
-            IMMDevice device = null;
-            if (_enumerator.GetDefaultAudioEndpoint(CoreAudio.ERender, CoreAudio.EMultimedia, out device) == 0)
-                device.GetId(out id);
+            _defaultId = null;
+            if (_enumerator.GetDefaultAudioEndpoint(CoreAudio.ERender, CoreAudio.EMultimedia, out IMMDevice device) != 0)
+                return;
             try
             {
-                if (id == _defaultId)
-                    return;
-                ReleaseDefaultDevice();
-                _defaultId = id;
-                if (id == null)
-                    return;
-                _defaultName = CoreAudio.GetFriendlyName(device) ?? "Speakers";
-                _endpointVolume = CoreAudio.Activate<IAudioEndpointVolume>(device);
-                _endpointMeter = CoreAudio.Activate<IAudioMeterInformation>(device);
-                _endpointVolume?.RegisterControlChangeNotify(_volumeNotifier);
+                if (device.GetId(out string id) == 0)
+                    _defaultId = id;
             }
             finally
             {
                 CoreAudio.Release(device);
             }
-        }
-
-        void ReleaseDefaultDevice()
-        {
-            if (_endpointVolume != null)
-            {
-                try { _endpointVolume.UnregisterControlChangeNotify(_volumeNotifier); }
-                catch (COMException) { }
-            }
-            CoreAudio.Release(_endpointVolume);
-            CoreAudio.Release(_endpointMeter);
-            _endpointVolume = null;
-            _endpointMeter = null;
-            _defaultId = null;
         }
 
         void CollectSessions(string deviceId, IAudioSessionManager2 manager, List<Session> found, HashSet<uint> livePids)
@@ -465,15 +470,25 @@ namespace TrayMixer
         MixerSnapshot BuildSnapshot(bool withPeaks)
         {
             var snapshot = new MixerSnapshot();
-            if (_endpointVolume != null
-                && _endpointVolume.GetMasterVolumeLevelScalar(out float masterVolume) == 0
-                && _endpointVolume.GetMute(out bool masterMuted) == 0)
+            foreach (var pair in _devices)
             {
-                snapshot.DeviceName = _defaultName;
-                snapshot.Master = new Level((int)Math.Round(masterVolume * 100), masterMuted);
-                if (withPeaks && _endpointMeter != null && _endpointMeter.GetPeakValue(out float peak) == 0)
-                    snapshot.MasterPeak = peak * snapshot.Master.Gain;
+                Device device = pair.Value;
+                if (device.Volume == null
+                    || device.Volume.GetMasterVolumeLevelScalar(out float deviceVolume) != 0
+                    || device.Volume.GetMute(out bool deviceMuted) != 0)
+                    continue;
+                var state = new DeviceState
+                {
+                    Id = pair.Key,
+                    Name = device.Name,
+                    Level = new Level((int)Math.Round(deviceVolume * 100), deviceMuted),
+                    IsDefault = pair.Key == _defaultId,
+                };
+                if (withPeaks && device.Meter != null && device.Meter.GetPeakValue(out float devicePeak) == 0)
+                    state.Peak = devicePeak * state.Level.Gain;
+                snapshot.Devices.Add(state);
             }
+            snapshot.Devices.Sort((a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
 
             var apps = new Dictionary<string, AppState>();
             var fromDefaultDevice = new HashSet<string>();
@@ -560,7 +575,8 @@ namespace TrayMixer
         static string Signature(MixerSnapshot snapshot)
         {
             var sb = new StringBuilder();
-            sb.Append(snapshot.DeviceName).Append('|').Append(snapshot.Master.Volume).Append(snapshot.Master.Muted);
+            foreach (var device in snapshot.Devices)
+                sb.Append('|').Append(device.Id).Append(device.Name).Append(device.Level.Volume).Append(device.Level.Muted).Append(device.IsDefault);
             foreach (var app in snapshot.Apps)
                 sb.Append('|').Append(app.Key).Append(app.Name).Append(app.Level.Volume).Append(app.Level.Muted);
             return sb.ToString();
@@ -583,7 +599,6 @@ namespace TrayMixer
                     Guarded(() => ApplyLevel(session, DiscordSoundsKey, Level.Default));
             }
             ReleaseSessions(_sessions);
-            ReleaseDefaultDevice();
             foreach (string id in new List<string>(_devices.Keys))
                 DropDevice(id);
             CoreAudio.Release(_enumerator);

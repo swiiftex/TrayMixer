@@ -9,6 +9,8 @@ using Microsoft.Win32;
 
 namespace TrayMixer
 {
+    enum DeviceIcon { Speaker, Media, Music, Chat, Game }
+
     static class Glyphs
     {
         public static readonly string FontName = FirstInstalled("Segoe Fluent Icons", "Segoe MDL2 Assets");
@@ -19,6 +21,18 @@ namespace TrayMixer
         public const string Bell = "";
         public const string SystemSounds = "";
         public const string More = "";
+
+        public static string ForDevice(DeviceIcon icon, Level level)
+        {
+            switch (icon)
+            {
+                case DeviceIcon.Media: return "\uE786";
+                case DeviceIcon.Music: return "\uE8D6";
+                case DeviceIcon.Chat: return "\uE8F2";
+                case DeviceIcon.Game: return "\uE7FC";
+                default: return ForVolume(level);
+            }
+        }
 
         public static string ForVolume(Level level)
         {
@@ -76,14 +90,34 @@ namespace TrayMixer
     {
         public Color Background, Border, Text, SubText, Hover, Pressed, Separator, Track, ThumbOuter, ThumbBorder, MutedFill, Accent, Peak;
 
-        public static Palette Current()
+        public static Palette Current() => For(SystemTheme.AppsUseLightTheme);
+
+        public static Palette For(bool light)
         {
-            bool light = SystemTheme.AppsUseLightTheme;
             Color accent = SystemTheme.Accent(light);
             var palette = light ? LightBase() : DarkBase();
+            // A grey or very dark accent can disappear against the flyout; fall back to the text colour then.
+            if (Contrast(accent, palette.Background) < 3)
+                accent = palette.Text;
             palette.Accent = accent;
-            palette.Peak = Blend(accent, Color.White, light ? 0.55f : 0.5f);
+            palette.Peak = Blend(accent, Luminance(accent) > 0.4 ? palette.Background : Color.White, 0.5f);
             return palette;
+        }
+
+        static double Luminance(Color color)
+        {
+            double Channel(int value)
+            {
+                double c = value / 255.0;
+                return c <= 0.03928 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
+            }
+            return 0.2126 * Channel(color.R) + 0.7152 * Channel(color.G) + 0.0722 * Channel(color.B);
+        }
+
+        static double Contrast(Color a, Color b)
+        {
+            double la = Luminance(a), lb = Luminance(b);
+            return (Math.Max(la, lb) + 0.05) / (Math.Min(la, lb) + 0.05);
         }
 
         static Palette DarkBase() => new Palette
@@ -127,27 +161,8 @@ namespace TrayMixer
         public static Icon Create(string glyph, bool lightTaskbar)
         {
             Size size = SystemInformation.SmallIconSize;
-            using (var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppArgb))
+            using (var bitmap = GlyphBitmap(glyph, size.Height, lightTaskbar ? Color.Black : Color.White))
             {
-                using (var g = Graphics.FromImage(bitmap))
-                using (var family = new FontFamily(Glyphs.FontName))
-                using (var path = new GraphicsPath())
-                using (var format = new StringFormat(StringFormat.GenericTypographic))
-                {
-                    Color color = lightTaskbar ? Color.Black : Color.White;
-                    g.Clear(Color.Transparent);
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    format.Alignment = StringAlignment.Center;
-                    format.LineAlignment = StringAlignment.Center;
-                    path.AddString(glyph, family, (int)FontStyle.Regular, size.Height, new RectangleF(0, 0, size.Width, size.Height), format);
-                    // The icon font's hairline strokes look faint at tray size, so thicken them slightly.
-                    using (var brush = new SolidBrush(color))
-                    using (var pen = new Pen(color, size.Height / 20f) { LineJoin = LineJoin.Round })
-                    {
-                        g.FillPath(brush, path);
-                        g.DrawPath(pen, path);
-                    }
-                }
                 IntPtr handle = bitmap.GetHicon();
                 try
                 {
@@ -158,6 +173,29 @@ namespace TrayMixer
                     Native.DestroyIcon(handle);
                 }
             }
+        }
+
+        // Small glyph images for the tray and menus; the icon font's hairline strokes are thickened slightly so they
+        // don't look faint at 16 px.
+        public static Bitmap GlyphBitmap(string glyph, int size, Color color)
+        {
+            var bitmap = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(bitmap))
+            using (var family = new FontFamily(Glyphs.FontName))
+            using (var path = new GraphicsPath())
+            using (var format = new StringFormat(StringFormat.GenericTypographic))
+            using (var brush = new SolidBrush(color))
+            using (var pen = new Pen(color, size / 20f) { LineJoin = LineJoin.Round })
+            {
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                path.AddString(glyph, family, (int)FontStyle.Regular, size, new RectangleF(0, 0, size, size), format);
+                g.FillPath(brush, path);
+                g.DrawPath(pen, path);
+            }
+            return bitmap;
         }
     }
 

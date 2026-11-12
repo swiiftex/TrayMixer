@@ -8,15 +8,23 @@ using System.Windows.Forms;
 namespace TrayMixer
 {
     // Borderless flyout shown above the tray icon, painted by hand so it scales cleanly on any monitor.
+    // One output device gets a horizontal volume row; two or more are laid out side by side as vertical sliders.
+    // Below them is one row per app, at most six at a time, with the rest scrolled.
     sealed class MixerPopup : Form
     {
-        public const string MasterKey = "#master";
+        public const string DevicePrefix = "#device:";
 
         const int BaseWidth = 360;
         const int HeaderHeight = 48;
-        const int MasterRowHeight = 44;
+        const int DeviceRowHeight = 44;
+        const int ColumnWidth = 84;
+        const int ColumnMaxWidth = 96;
+        const int ColumnHeight = 232;
+        const int ColumnTrackTop = 52;
+        const int ColumnTrackLength = 112;
         const int SeparatorHeight = 17;
         const int AppRowHeight = 52;
+        const int MaxVisibleApps = 6;
         const int EmptyHeight = 40;
         const int BottomPadding = 8;
         const int PendingMilliseconds = 400;
@@ -27,14 +35,15 @@ namespace TrayMixer
         sealed class Row
         {
             public string Key;
+            public bool IsDevice;
+            public bool Vertical;
             public RowKind Kind;
+            public DeviceIcon Icon;
             public string Label;
             public string ImagePath;
             public Level Level;
             public float Peak;
-            public int Top;
-            public int Height;
-            public bool IsMaster => Key == MasterKey;
+            public Rectangle Box;   // devices: client coordinates; apps: content coordinates before scrolling
         }
 
         readonly ContextMenuStrip _menu;
@@ -43,19 +52,28 @@ namespace TrayMixer
         MixerSnapshot _snapshot;
         Palette _palette = Palette.Current();
         float _scale = 1f;
-        Font _titleFont, _labelFont, _valueFont, _iconFont, _badgeFont;
+        Font _titleFont, _labelFont, _smallFont, _valueFont, _iconFont, _badgeFont;
         bool _dwmDrawsBorder;
         Point _anchor;
         string _layoutSignature;
-        int _appsTop, _appsBottom, _contentHeight, _scroll, _maxScroll;
-        string _dragKey, _hoverKey, _pressKey, _focusKey = MasterKey;
+        int _width = BaseWidth;
+        int _appsTop, _appsBottom, _scroll, _maxScroll;
+        string _dragKey, _hoverKey, _pressKey, _focusKey;
         Part _hoverPart;
-        bool _hoverMore, _pressMore, _showFocus, _menuFromPopup;
+        bool _hoverMore, _pressMore, _showFocus;
+        bool _draggingScroll, _hoverScroll;
+        float _scrollGrab;
         int _wheelRemainder;
 
         public event Action<string, Level> LevelChanged;
 
         public int HiddenAtTick { get; private set; } = Environment.TickCount - 10000;
+
+        // True while the shared menu is open from this flyout's ⋯ button rather than from the tray icon.
+        public bool MenuOpenedHere { get; private set; }
+
+        // Which devices get a volume control and with which icon; owned by the settings.
+        public List<DeviceChoice> DeviceChoices { get; set; } = new List<DeviceChoice>();
 
         public MixerPopup(ContextMenuStrip menu)
         {
@@ -72,9 +90,9 @@ namespace TrayMixer
 
             _menu.Closed += (s, e) =>
             {
-                if (!_menuFromPopup)
+                if (!MenuOpenedHere)
                     return;
-                _menuFromPopup = false;
+                MenuOpenedHere = false;
                 if (Visible && GetForegroundWindow() != Handle)
                     HidePopup();
             };
@@ -108,8 +126,20 @@ namespace TrayMixer
                 previous[row.Key] = row;
 
             _rows.Clear();
-            if (snapshot.HasDevice)
-                _rows.Add(new Row { Key = MasterKey, Level = snapshot.Master, Peak = snapshot.MasterPeak });
+            List<DeviceState> devices = ShownDevices(snapshot);
+            foreach (var device in devices)
+            {
+                _rows.Add(new Row
+                {
+                    Key = DevicePrefix + device.Id,
+                    IsDevice = true,
+                    Vertical = devices.Count > 1,
+                    Icon = DeviceChoices.Find(c => c.Id == device.Id)?.Icon ?? DeviceIcon.Speaker,
+                    Label = device.Name,
+                    Level = device.Level,
+                    Peak = device.Peak,
+                });
+            }
             foreach (var app in snapshot.Apps)
                 _rows.Add(new Row { Key = app.Key, Kind = app.Kind, Label = app.Name, ImagePath = app.ImagePath, Level = app.Level, Peak = app.Peak });
 
@@ -125,9 +155,29 @@ namespace TrayMixer
                     row.Level = old.Level;
             }
 
-            if (Visible)
-                Arrange(resizeWindow: true);
+            Arrange(resizeWindow: Visible);
             Invalidate();
+        }
+
+        // Re-applies the last snapshot, e.g. after the device choices changed.
+        public void RefreshLayout()
+        {
+            if (_snapshot != null)
+                ApplySnapshot(_snapshot);
+        }
+
+        List<DeviceState> ShownDevices(MixerSnapshot snapshot)
+        {
+            var shown = new List<DeviceState>();
+            foreach (var choice in DeviceChoices)
+            {
+                DeviceState device = choice.Shown ? snapshot.Devices.Find(d => d.Id == choice.Id) : null;
+                if (device != null)
+                    shown.Add(device);
+            }
+            if (shown.Count == 0 && snapshot.DefaultDevice != null)
+                shown.Add(snapshot.DefaultDevice);
+            return shown;
         }
 
         // ---- Showing and placement ----
@@ -141,7 +191,7 @@ namespace TrayMixer
             _scale = DpiAt(anchor) / 96f;
             _scroll = 0;
             _showFocus = false;
-            _focusKey = MasterKey;
+            _focusKey = null;
             RebuildFonts();
             _layoutSignature = null;
             Arrange(resizeWindow: true);
@@ -161,55 +211,54 @@ namespace TrayMixer
                 return;
             HiddenAtTick = Environment.TickCount;
             _dragKey = _hoverKey = _pressKey = null;
-            _hoverMore = _pressMore = false;
+            _hoverMore = _pressMore = _draggingScroll = _hoverScroll = false;
             Hide();
         }
 
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
-            if (!_menuFromPopup)
+            if (!MenuOpenedHere)
                 HidePopup();
         }
 
         void Arrange(bool resizeWindow)
         {
+            var devices = _rows.FindAll(r => r.IsDevice);
+            var apps = _rows.FindAll(r => !r.IsDevice);
+            _width = Math.Max(S(BaseWidth), devices.Count > 1 ? devices.Count * S(ColumnWidth) + S(32) : 0);
+
             int y = S(HeaderHeight);
-            foreach (var row in _rows)
+            if (devices.Count == 1)
             {
-                if (!row.IsMaster)
-                    continue;
-                row.Top = y;
-                row.Height = S(MasterRowHeight);
-                y += row.Height + S(SeparatorHeight);
+                devices[0].Box = new Rectangle(0, y, _width, S(DeviceRowHeight));
+                y += S(DeviceRowHeight) + S(SeparatorHeight);
             }
+            else if (devices.Count > 1)
+            {
+                int column = Math.Min(S(ColumnMaxWidth), (_width - S(32)) / devices.Count);
+                int left = (_width - column * devices.Count) / 2;
+                for (int i = 0; i < devices.Count; i++)
+                    devices[i].Box = new Rectangle(left + i * column, y, column, S(ColumnHeight));
+                y += S(ColumnHeight) + S(SeparatorHeight);
+            }
+
             _appsTop = y;
-            bool anyApps = false;
-            foreach (var row in _rows)
-            {
-                if (row.IsMaster)
-                    continue;
-                row.Top = y;
-                row.Height = S(AppRowHeight);
-                y += row.Height;
-                anyApps = true;
-            }
-            if (!anyApps)
-                y += S(EmptyHeight);
-            _contentHeight = y + S(BottomPadding);
+            for (int i = 0; i < apps.Count; i++)
+                apps[i].Box = new Rectangle(0, y + i * S(AppRowHeight), _width, S(AppRowHeight));
+            int viewport = apps.Count == 0 ? S(EmptyHeight) : Math.Min(apps.Count, MaxVisibleApps) * S(AppRowHeight);
 
             Rectangle work = Screen.FromPoint(_anchor).WorkingArea;
-            int maxHeight = work.Height - 2 * S(12);
-            int height = Math.Min(_contentHeight, maxHeight);
-            _maxScroll = _contentHeight - height;
+            int height = Math.Min(_appsTop + viewport + S(BottomPadding), work.Height - 2 * S(12));
             _appsBottom = height - S(BottomPadding);
+            _maxScroll = Math.Max(0, apps.Count * S(AppRowHeight) - (_appsBottom - _appsTop));
             _scroll = Math.Max(0, Math.Min(_scroll, _maxScroll));
 
-            string signature = _rows.Count + "|" + height + "|" + _scale;
+            string signature = _width + "|" + height + "|" + _scale;
             if (resizeWindow && signature != _layoutSignature)
             {
                 _layoutSignature = signature;
-                Bounds = BoundsNear(_anchor, new Size(S(BaseWidth), height));
+                Bounds = BoundsNear(_anchor, new Size(_width, height));
             }
         }
 
@@ -245,26 +294,95 @@ namespace TrayMixer
         // ---- Geometry ----
 
         int S(float value) => (int)Math.Round(value * _scale);
-        Rectangle TitleRect => new Rectangle(S(16), S(14), Width - S(64), S(20));
-        Rectangle MoreRect => new Rectangle(Width - S(44), S(8), S(32), S(32));
-        int TrackLeft => S(66);
-        int TrackRight => Width - S(70);
-        int ScreenTop(Row row) => row.IsMaster ? row.Top : row.Top - _scroll;
-        int SliderY(Row row) => ScreenTop(row) + (row.IsMaster ? S(22) : S(34));
-        Rectangle IconRect(Row row) => new Rectangle(S(12), SliderY(row) - S(16), S(32), S(32));
-        Rectangle LabelRect(Row row) => new Rectangle(S(56), ScreenTop(row) + S(6), Width - S(72), S(18));
-        Rectangle ValueRect(Row row) => new Rectangle(Width - S(48), SliderY(row) - S(12), S(32), S(24));
-        Rectangle SliderHitRect(Row row) => Rectangle.FromLTRB(TrackLeft - S(12), SliderY(row) - S(14), TrackRight + S(12), SliderY(row) + S(14));
-        float ThumbX(Row row) => TrackLeft + (TrackRight - TrackLeft) * row.Level.Volume / 100f;
+        Rectangle TitleRect => new Rectangle(S(16), S(14), _width - S(64), S(20));
+        Rectangle MoreRect => new Rectangle(_width - S(44), S(8), S(32), S(32));
+
+        Rectangle ScreenBox(Row row) => row.IsDevice ? row.Box : new Rectangle(row.Box.X, row.Box.Y - _scroll, row.Box.Width, row.Box.Height);
+
+        // The ends of the slider track: Start is 0 %, End is 100 %.
+        PointF TrackStart(Row row)
+        {
+            Rectangle box = ScreenBox(row);
+            if (row.Vertical)
+                return new PointF(box.Left + box.Width / 2f, box.Top + S(ColumnTrackTop + ColumnTrackLength));
+            return new PointF(S(66), SliderY(row));
+        }
+
+        PointF TrackEnd(Row row)
+        {
+            Rectangle box = ScreenBox(row);
+            if (row.Vertical)
+                return new PointF(box.Left + box.Width / 2f, box.Top + S(ColumnTrackTop));
+            return new PointF(_width - S(70), SliderY(row));
+        }
+
+        PointF Along(Row row, float fraction)
+        {
+            PointF start = TrackStart(row), end = TrackEnd(row);
+            return new PointF(start.X + (end.X - start.X) * fraction, start.Y + (end.Y - start.Y) * fraction);
+        }
+
+        int SliderY(Row row) => ScreenBox(row).Top + (row.IsDevice ? S(22) : S(34));
+
+        Rectangle IconRect(Row row)
+        {
+            if (row.Vertical)
+            {
+                Rectangle box = ScreenBox(row);
+                return new Rectangle(box.Left + box.Width / 2 - S(16), box.Top + S(4), S(32), S(32));
+            }
+            return new Rectangle(S(12), SliderY(row) - S(16), S(32), S(32));
+        }
+
+        Rectangle LabelRect(Row row)
+        {
+            Rectangle box = ScreenBox(row);
+            if (row.Vertical)
+                return new Rectangle(box.Left + S(4), box.Top + S(196), box.Width - S(8), S(32));
+            return new Rectangle(S(56), box.Top + S(6), _width - S(72), S(18));
+        }
+
+        Rectangle ValueRect(Row row)
+        {
+            if (row.Vertical)
+            {
+                Rectangle box = ScreenBox(row);
+                return new Rectangle(box.Left, box.Top + S(176), box.Width, S(18));
+            }
+            return new Rectangle(_width - S(48), SliderY(row) - S(12), S(32), S(24));
+        }
+
+        Rectangle SliderHitRect(Row row)
+        {
+            PointF start = TrackStart(row), end = TrackEnd(row);
+            if (row.Vertical)
+                return Rectangle.FromLTRB((int)start.X - S(14), (int)end.Y - S(12), (int)start.X + S(14), (int)start.Y + S(12));
+            return Rectangle.FromLTRB((int)start.X - S(12), (int)start.Y - S(14), (int)end.X + S(12), (int)start.Y + S(14));
+        }
+
+        Rectangle ScrollTrackRect => Rectangle.FromLTRB(_width - S(10), _appsTop + S(4), _width - S(2), _appsBottom - S(4));
+
+        RectangleF ScrollThumbRect
+        {
+            get
+            {
+                Rectangle track = ScrollTrackRect;
+                float viewport = _appsBottom - _appsTop;
+                float thumb = Math.Max(S(24), track.Height * viewport / (viewport + _maxScroll));
+                float top = track.Top + (track.Height - thumb) * _scroll / Math.Max(1, _maxScroll);
+                return new RectangleF(track.Left, top, track.Width, thumb);
+            }
+        }
+
+        bool InApps(Point point) => point.Y >= _appsTop && point.Y < _appsBottom;
 
         Row RowAt(Point point)
         {
             foreach (var row in _rows)
             {
-                if (!row.IsMaster && (point.Y < _appsTop || point.Y >= _appsBottom))
+                if (!row.IsDevice && !InApps(point))
                     continue;
-                int top = ScreenTop(row);
-                if (point.Y >= top && point.Y < top + row.Height)
+                if (ScreenBox(row).Contains(point))
                     return row;
             }
             return null;
@@ -283,6 +401,8 @@ namespace TrayMixer
 
         // ---- Painting ----
 
+        const TextFormatFlags LineFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter;
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -295,7 +415,11 @@ namespace TrayMixer
             }
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            string title = _snapshot == null ? "Looking for audio devices…" : _snapshot.DeviceName ?? "No output device";
+            var devices = _rows.FindAll(r => r.IsDevice);
+            string title = _snapshot == null ? "Looking for audio devices…"
+                : devices.Count == 0 ? "No output device"
+                : devices.Count == 1 ? devices[0].Label
+                : "Volume mixer";
             TextRenderer.DrawText(g, title, _titleFont, TitleRect, p.Text, LineFlags | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
             if (_hoverMore || _pressMore)
             {
@@ -304,47 +428,44 @@ namespace TrayMixer
             }
             TextRenderer.DrawText(g, Glyphs.More, _iconFont, MoreRect, p.Text, LineFlags | TextFormatFlags.HorizontalCenter);
 
-            Row master = FindRow(MasterKey);
-            if (master != null)
+            foreach (var device in devices)
+                DrawControl(g, device);
+            if (devices.Count > 0)
             {
-                DrawRow(g, master);
-                int lineY = master.Top + master.Height + S(SeparatorHeight) / 2;
+                int lineY = _appsTop - S(SeparatorHeight) / 2 - 1;
                 using (var pen = new Pen(p.Separator))
-                    g.DrawLine(pen, S(16), lineY, Width - S(16), lineY);
+                    g.DrawLine(pen, S(16), lineY, _width - S(16), lineY);
             }
 
-            g.SetClip(Rectangle.FromLTRB(0, _appsTop, Width, _appsBottom));
+            g.SetClip(Rectangle.FromLTRB(0, _appsTop, _width, _appsBottom));
             bool anyApps = false;
             foreach (var row in _rows)
             {
-                if (row.IsMaster)
+                if (row.IsDevice)
                     continue;
                 anyApps = true;
-                int top = ScreenTop(row);
-                if (top + row.Height > _appsTop && top < _appsBottom)
-                    DrawRow(g, row);
+                Rectangle box = ScreenBox(row);
+                if (box.Bottom > _appsTop && box.Top < _appsBottom)
+                    DrawControl(g, row);
             }
             if (!anyApps && _snapshot != null)
             {
-                var empty = new Rectangle(S(16), _appsTop, Width - S(32), S(EmptyHeight) - S(8));
+                var empty = new Rectangle(S(16), _appsTop, _width - S(32), S(EmptyHeight) - S(8));
                 TextRenderer.DrawText(g, "No apps are using audio right now", _labelFont, empty, p.SubText, LineFlags | TextFormatFlags.Left);
             }
             g.ResetClip();
 
             if (_maxScroll > 0)
             {
-                float viewport = _appsBottom - _appsTop;
-                float content = viewport + _maxScroll;
-                float thumbHeight = Math.Max(S(24), viewport * viewport / content);
-                float thumbTop = _appsTop + (viewport - thumbHeight) * _scroll / _maxScroll;
-                using (var brush = new SolidBrush(Color.FromArgb(110, p.SubText)))
-                    g.FillRoundedRectangle(brush, new RectangleF(Width - S(6), thumbTop, S(3), thumbHeight), S(1.5f));
+                RectangleF thumb = ScrollThumbRect;
+                float width = (_hoverScroll || _draggingScroll ? 5 : 3) * _scale;
+                var bar = new RectangleF(thumb.Right - S(2) - width, thumb.Top, width, thumb.Height);
+                using (var brush = new SolidBrush(Color.FromArgb(_hoverScroll || _draggingScroll ? 170 : 110, p.SubText)))
+                    g.FillRoundedRectangle(brush, bar, width / 2);
             }
         }
 
-        const TextFormatFlags LineFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter;
-
-        void DrawRow(Graphics g, Row row)
+        void DrawControl(Graphics g, Row row)
         {
             Palette p = _palette;
             Rectangle icon = IconRect(row);
@@ -356,69 +477,111 @@ namespace TrayMixer
                 using (var brush = new SolidBrush(iconBackground))
                     g.FillRoundedRectangle(brush, icon, S(4));
             }
-            DrawRowIcon(g, row, icon, iconBackground);
+            DrawIcon(g, row, icon, iconBackground);
 
-            if (row.Label != null)
+            if (!row.IsDevice)
                 TextRenderer.DrawText(g, row.Label, _labelFont, LabelRect(row), p.Text, LineFlags | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+            else if (row.Vertical)
+                DrawDeviceName(g, row.Label, LabelRect(row));
 
-            Color fill = row.Level.Muted ? p.MutedFill : p.Accent;
-            float cy = SliderY(row), thickness = 4 * _scale, x = ThumbX(row);
-            using (var track = new Pen(p.Track, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                g.DrawLine(track, x, cy, TrackRight, cy);
-            if (x > TrackLeft)
-            {
-                using (var filled = new Pen(fill, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                    g.DrawLine(filled, TrackLeft, cy, x, cy);
-                float peakX = TrackLeft + (TrackRight - TrackLeft) * Math.Min(row.Peak, row.Level.Gain);
-                if (!row.Level.Muted && peakX > TrackLeft + 1)
-                {
-                    using (var peak = new Pen(p.Peak, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                        g.DrawLine(peak, TrackLeft, cy, peakX, cy);
-                }
-            }
+            DrawSlider(g, row);
 
-            bool hoverSlider = (_hoverKey == row.Key && _hoverPart == Part.Slider) || _dragKey == row.Key;
-            float outer = 10 * _scale;
-            float inner = (_dragKey == row.Key ? 5 : hoverSlider ? 7 : 6) * _scale;
-            using (var brush = new SolidBrush(p.ThumbOuter))
-                g.FillEllipse(brush, x - outer, cy - outer, outer * 2, outer * 2);
-            using (var pen = new Pen(p.ThumbBorder))
-                g.DrawEllipse(pen, x - outer, cy - outer, outer * 2, outer * 2);
-            using (var brush = new SolidBrush(fill))
-                g.FillEllipse(brush, x - inner, cy - inner, inner * 2, inner * 2);
-
-            TextRenderer.DrawText(g, row.Level.Volume.ToString(), _valueFont, ValueRect(row), row.Level.Muted ? p.SubText : p.Text, LineFlags | TextFormatFlags.Right);
+            var valueFlags = LineFlags | (row.Vertical ? TextFormatFlags.HorizontalCenter : TextFormatFlags.Right);
+            TextRenderer.DrawText(g, row.Level.Volume.ToString(), _valueFont, ValueRect(row), row.Level.Muted ? p.SubText : p.Text, valueFlags);
 
             if (_showFocus && _focusKey == row.Key)
             {
-                var focus = new RectangleF(S(4), ScreenTop(row) + S(2), Width - S(8), row.Height - S(4));
+                Rectangle box = ScreenBox(row);
+                var focus = row.Vertical
+                    ? new RectangleF(box.Left + S(2), box.Top, box.Width - S(4), box.Height)
+                    : new RectangleF(S(4), box.Top + S(2), _width - S(8), box.Height - S(4));
                 using (var pen = new Pen(p.Text, 2 * _scale))
                 using (var path = RoundedPath(focus, S(6)))
                     g.DrawPath(pen, path);
             }
         }
 
-        void DrawRowIcon(Graphics g, Row row, Rectangle bounds, Color background)
+        // Device names look like "Headphones (Arctis Nova Pro Wireless)": the endpoint goes on the first line and the
+        // hardware on the second, so narrow columns stay readable.
+        void DrawDeviceName(Graphics g, string name, Rectangle bounds)
+        {
+            string first = name, second = null;
+            int split = name.IndexOf(" (", StringComparison.Ordinal);
+            if (split > 0)
+            {
+                first = name.Substring(0, split);
+                second = name.Substring(split + 2).TrimEnd();
+                if (second.EndsWith(")"))
+                    second = second.Substring(0, second.Length - 1);
+            }
+            const TextFormatFlags flags = LineFlags | TextFormatFlags.HorizontalCenter | TextFormatFlags.EndEllipsis;
+            var top = new Rectangle(bounds.Left, bounds.Top, bounds.Width, bounds.Height / 2);
+            var bottom = new Rectangle(bounds.Left, top.Bottom, bounds.Width, bounds.Height - top.Height);
+            TextRenderer.DrawText(g, first, _smallFont, top, _palette.Text, flags);
+            if (second != null)
+                TextRenderer.DrawText(g, second, _smallFont, bottom, _palette.SubText, flags);
+        }
+
+        void DrawSlider(Graphics g, Row row)
         {
             Palette p = _palette;
-            if (row.IsMaster || row.Kind == RowKind.SystemSounds)
+            Color fill = row.Level.Muted ? p.MutedFill : p.Accent;
+            float thickness = 4 * _scale;
+            PointF start = TrackStart(row), end = TrackEnd(row), thumb = Along(row, row.Level.Volume / 100f);
+
+            using (var track = new Pen(p.Track, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                g.DrawLine(track, thumb, end);
+            if (row.Level.Volume > 0)
             {
-                string glyph = row.IsMaster ? Glyphs.ForVolume(row.Level) : row.Level.Muted ? Glyphs.Mute : Glyphs.SystemSounds;
+                using (var filled = new Pen(fill, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawLine(filled, start, thumb);
+                float peak = Math.Min(row.Peak, row.Level.Gain);
+                if (!row.Level.Muted && peak > 0.01f)
+                {
+                    using (var meter = new Pen(p.Peak, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        g.DrawLine(meter, start, Along(row, peak));
+                }
+            }
+
+            bool hover = (_hoverKey == row.Key && _hoverPart == Part.Slider) || _dragKey == row.Key;
+            float outer = 10 * _scale;
+            float inner = (_dragKey == row.Key ? 5 : hover ? 7 : 6) * _scale;
+            using (var brush = new SolidBrush(p.ThumbOuter))
+                g.FillEllipse(brush, thumb.X - outer, thumb.Y - outer, outer * 2, outer * 2);
+            using (var pen = new Pen(p.ThumbBorder))
+                g.DrawEllipse(pen, thumb.X - outer, thumb.Y - outer, outer * 2, outer * 2);
+            using (var brush = new SolidBrush(fill))
+                g.FillEllipse(brush, thumb.X - inner, thumb.Y - inner, inner * 2, inner * 2);
+        }
+
+        void DrawIcon(Graphics g, Row row, Rectangle bounds, Color background)
+        {
+            Palette p = _palette;
+            bool speakerGlyph = (row.IsDevice && row.Icon == DeviceIcon.Speaker) || row.Kind == RowKind.SystemSounds;
+            if (speakerGlyph)
+            {
+                // These glyphs show mute themselves.
+                string glyph = row.IsDevice ? Glyphs.ForVolume(row.Level) : row.Level.Muted ? Glyphs.Mute : Glyphs.SystemSounds;
                 TextRenderer.DrawText(g, glyph, _iconFont, bounds, p.Text, LineFlags | TextFormatFlags.HorizontalCenter);
                 return;
             }
 
             int size = S(24);
             var image = new Rectangle(bounds.X + (bounds.Width - size) / 2, bounds.Y + (bounds.Height - size) / 2, size, size);
-            Icon icon = AppIcons.Get(row.ImagePath, size);
-            if (icon != null)
-                g.DrawIcon(icon, image);
+            if (row.IsDevice)
+                TextRenderer.DrawText(g, Glyphs.ForDevice(row.Icon, row.Level), _iconFont, bounds, p.Text, LineFlags | TextFormatFlags.HorizontalCenter);
             else
             {
-                using (var brush = new SolidBrush(p.MutedFill))
-                    g.FillRoundedRectangle(brush, image, S(5));
-                string letter = string.IsNullOrEmpty(row.Label) ? "?" : row.Label.Substring(0, 1).ToUpperInvariant();
-                TextRenderer.DrawText(g, letter, _valueFont, image, Color.White, LineFlags | TextFormatFlags.HorizontalCenter);
+                Icon icon = AppIcons.Get(row.ImagePath, size);
+                if (icon != null)
+                    g.DrawIcon(icon, image);
+                else
+                {
+                    using (var brush = new SolidBrush(p.MutedFill))
+                        g.FillRoundedRectangle(brush, image, S(5));
+                    string letter = string.IsNullOrEmpty(row.Label) ? "?" : row.Label.Substring(0, 1).ToUpperInvariant();
+                    TextRenderer.DrawText(g, letter, _valueFont, image, Color.White, LineFlags | TextFormatFlags.HorizontalCenter);
+                }
             }
 
             if (row.Level.Muted)
@@ -473,10 +636,20 @@ namespace TrayMixer
                 Change(row, new Level(row.Level.Volume, !row.Level.Muted));
         }
 
-        void SetFromX(Row row, int x)
+        void SetFromPoint(Row row, Point point)
         {
-            float fraction = (x - TrackLeft) / (float)(TrackRight - TrackLeft);
+            PointF start = TrackStart(row), end = TrackEnd(row);
+            float fraction = row.Vertical
+                ? (start.Y - point.Y) / (start.Y - end.Y)
+                : (point.X - start.X) / (end.X - start.X);
             Change(row, new Level((int)Math.Round(fraction * 100), false));
+        }
+
+        void ScrollToThumb(float thumbTop)
+        {
+            Rectangle track = ScrollTrackRect;
+            float travel = track.Height - ScrollThumbRect.Height;
+            ScrollTo(travel <= 0 ? 0 : (int)Math.Round((thumbTop - track.Top) / travel * _maxScroll));
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -490,13 +663,24 @@ namespace TrayMixer
                 Invalidate();
                 return;
             }
+            if (_maxScroll > 0 && ScrollTrackRect.Contains(e.Location))
+            {
+                RectangleF thumb = ScrollThumbRect;
+                if (e.Y < thumb.Top || e.Y >= thumb.Bottom)
+                    ScrollToThumb(e.Y - thumb.Height / 2);
+                _draggingScroll = true;
+                _scrollGrab = e.Y - ScrollThumbRect.Top;
+                Capture = true;
+                Invalidate();
+                return;
+            }
             Row row = RowAt(e.Location);
             switch (PartAt(row, e.Location))
             {
                 case Part.Slider:
                     _dragKey = row.Key;
                     Capture = true;
-                    SetFromX(row, e.X);
+                    SetFromPoint(row, e.Location);
                     break;
                 case Part.Icon:
                     _pressKey = row.Key;
@@ -508,22 +692,29 @@ namespace TrayMixer
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (_draggingScroll)
+            {
+                ScrollToThumb(e.Y - _scrollGrab);
+                return;
+            }
             if (_dragKey != null)
             {
                 Row dragged = FindRow(_dragKey);
                 if (dragged != null)
-                    SetFromX(dragged, e.X);
+                    SetFromPoint(dragged, e.Location);
                 return;
             }
-            Row row = RowAt(e.Location);
+            bool hoverScroll = _maxScroll > 0 && ScrollTrackRect.Contains(e.Location);
+            Row row = hoverScroll ? null : RowAt(e.Location);
             Part part = PartAt(row, e.Location);
             string key = part == Part.None ? null : row.Key;
             bool hoverMore = MoreRect.Contains(e.Location);
-            if (key != _hoverKey || part != _hoverPart || hoverMore != _hoverMore)
+            if (key != _hoverKey || part != _hoverPart || hoverMore != _hoverMore || hoverScroll != _hoverScroll)
             {
                 _hoverKey = key;
                 _hoverPart = part;
                 _hoverMore = hoverMore;
+                _hoverScroll = hoverScroll;
                 Invalidate();
             }
         }
@@ -531,6 +722,11 @@ namespace TrayMixer
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (_draggingScroll)
+            {
+                _draggingScroll = false;
+                Capture = false;
+            }
             if (_dragKey != null)
             {
                 _dragKey = null;
@@ -548,7 +744,7 @@ namespace TrayMixer
                 _pressMore = false;
                 if (MoreRect.Contains(e.Location))
                 {
-                    _menuFromPopup = true;
+                    MenuOpenedHere = true;
                     _menu.Show(this, new Point(MoreRect.Right, MoreRect.Bottom), ToolStripDropDownDirection.BelowLeft);
                 }
             }
@@ -558,9 +754,10 @@ namespace TrayMixer
         protected override void OnMouseCaptureChanged(EventArgs e)
         {
             base.OnMouseCaptureChanged(e);
-            if (_dragKey != null && !Capture)
+            if (!Capture && (_dragKey != null || _draggingScroll))
             {
                 _dragKey = null;
+                _draggingScroll = false;
                 Invalidate();
             }
         }
@@ -568,31 +765,23 @@ namespace TrayMixer
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            if (_dragKey == null && (_hoverKey != null || _hoverMore))
+            if (_dragKey == null && !_draggingScroll && (_hoverKey != null || _hoverMore || _hoverScroll))
             {
                 _hoverKey = null;
-                _hoverMore = false;
+                _hoverMore = _hoverScroll = false;
                 Invalidate();
             }
         }
 
+        // The wheel only scrolls the app list; volumes change by dragging, clicking or the keyboard.
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
             _wheelRemainder += e.Delta;
             int notches = _wheelRemainder / 120;
             _wheelRemainder %= 120;
-            if (notches == 0)
-                return;
-
-            Row row = RowAt(e.Location);
-            bool inApps = e.Y >= _appsTop && e.Y < _appsBottom;
-            if (_maxScroll > 0 && inApps && PartAt(row, e.Location) != Part.Slider)
-            {
+            if (notches != 0 && _maxScroll > 0)
                 ScrollTo(_scroll - notches * S(AppRowHeight));
-                return;
-            }
-            Nudge(row ?? FindRow(MasterKey), notches * 2);
         }
 
         void ScrollTo(int offset)
@@ -614,13 +803,13 @@ namespace TrayMixer
             Row row = _rows[index];
             _focusKey = row.Key;
             _showFocus = true;
-            if (!row.IsMaster)
+            if (!row.IsDevice)
             {
-                int top = ScreenTop(row);
-                if (top < _appsTop)
-                    ScrollTo(_scroll - (_appsTop - top));
-                else if (top + row.Height > _appsBottom)
-                    ScrollTo(_scroll + (top + row.Height - _appsBottom));
+                Rectangle box = ScreenBox(row);
+                if (box.Top < _appsTop)
+                    ScrollTo(_scroll - (_appsTop - box.Top));
+                else if (box.Bottom > _appsBottom)
+                    ScrollTo(_scroll + (box.Bottom - _appsBottom));
             }
             Invalidate();
         }
@@ -669,6 +858,7 @@ namespace TrayMixer
             DisposeFonts();
             _titleFont = new Font("Segoe UI Semibold", 14 * _scale, GraphicsUnit.Pixel);
             _labelFont = new Font("Segoe UI", 13 * _scale, GraphicsUnit.Pixel);
+            _smallFont = new Font("Segoe UI", 12 * _scale, GraphicsUnit.Pixel);
             _valueFont = new Font("Segoe UI", 14 * _scale, GraphicsUnit.Pixel);
             _iconFont = new Font(Glyphs.FontName, 18 * _scale, GraphicsUnit.Pixel);
             _badgeFont = new Font(Glyphs.FontName, 10 * _scale, GraphicsUnit.Pixel);
@@ -678,6 +868,7 @@ namespace TrayMixer
         {
             _titleFont?.Dispose();
             _labelFont?.Dispose();
+            _smallFont?.Dispose();
             _valueFont?.Dispose();
             _iconFont?.Dispose();
             _badgeFont?.Dispose();

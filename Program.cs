@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -26,7 +27,7 @@ namespace TrayMixer
                     if (quit)
                     {
                         Signal(QuitEventName);
-                        WaitForExit(mutex);
+                        WaitForOtherInstances();
                     }
                     else if (!trayOnly)
                     {
@@ -59,16 +60,21 @@ namespace TrayMixer
             catch (WaitHandleCannotBeOpenedException) { }
         }
 
-        static void WaitForExit(Mutex mutex)
+        // Waits for the running copy's process to end, not just for it to release the single-instance lock, so the
+        // installer can replace the exe straight afterwards.
+        static void WaitForOtherInstances()
         {
-            try
+            int deadline = Environment.TickCount + 5000;
+            using (Process self = Process.GetCurrentProcess())
             {
-                if (mutex.WaitOne(5000))
-                    mutex.ReleaseMutex();
-            }
-            catch (AbandonedMutexException)
-            {
-                mutex.ReleaseMutex();
+                foreach (Process other in Process.GetProcessesByName(self.ProcessName))
+                {
+                    using (other)
+                    {
+                        if (other.Id != self.Id)
+                            other.WaitForExit(Math.Max(0, deadline - Environment.TickCount));
+                    }
+                }
             }
         }
 

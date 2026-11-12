@@ -7,16 +7,30 @@ using Microsoft.Win32;
 
 namespace TrayMixer
 {
+    // A device the user has configured in the mixer: whether it gets a volume control there, and its icon.
+    sealed class DeviceChoice
+    {
+        public string Id;
+        public DeviceIcon Icon;
+        public bool Shown;
+    }
+
     sealed class Settings
     {
         static readonly string FolderPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TrayMixer");
         static readonly string FilePath = Path.Combine(FolderPath, "settings.ini");
         const string VolumePrefix = "app.";
+        const string DevicePrefix = "device.";
 
         // Remembered levels by app key (lower-case exe name, or one of the AudioEngine special keys).
         public Dictionary<string, Level> Volumes = new Dictionary<string, Level>(StringComparer.OrdinalIgnoreCase);
+
+        // Shown devices appear in the mixer in this order. With none shown, the mixer shows the default device.
+        public List<DeviceChoice> Devices = new List<DeviceChoice>();
         public bool IsFirstRun;
+
+        public DeviceChoice ChoiceFor(string deviceId) => Devices.Find(c => c.Id == deviceId);
 
         public static Settings Load()
         {
@@ -31,7 +45,21 @@ namespace TrayMixer
                 foreach (string line in File.ReadAllLines(FilePath))
                 {
                     int eq = line.IndexOf('=');
-                    if (eq < 0 || !line.StartsWith(VolumePrefix, StringComparison.Ordinal))
+                    if (eq < 0)
+                        continue;
+                    if (line.StartsWith(DevicePrefix, StringComparison.Ordinal))
+                    {
+                        string[] values = line.Substring(eq + 1).Split(',');
+                        Enum.TryParse(values[0].Trim(), true, out DeviceIcon icon);
+                        settings.Devices.Add(new DeviceChoice
+                        {
+                            Id = line.Substring(DevicePrefix.Length, eq - DevicePrefix.Length).Trim(),
+                            Icon = icon,
+                            Shown = values.Length > 1 && values[1].Trim() == "shown",
+                        });
+                        continue;
+                    }
+                    if (!line.StartsWith(VolumePrefix, StringComparison.Ordinal))
                         continue;
                     string key = line.Substring(VolumePrefix.Length, eq - VolumePrefix.Length).Trim();
                     string[] parts = line.Substring(eq + 1).Split(',');
@@ -50,6 +78,9 @@ namespace TrayMixer
             foreach (var entry in Volumes)
                 sb.Append(VolumePrefix).Append(entry.Key).Append('=').Append(entry.Value.Volume)
                   .Append(entry.Value.Muted ? ",muted" : "").Append("\r\n");
+            foreach (var device in Devices)
+                sb.Append(DevicePrefix).Append(device.Id).Append('=').Append(device.Icon)
+                  .Append(device.Shown ? ",shown" : "").Append("\r\n");
             try
             {
                 Directory.CreateDirectory(FolderPath);
