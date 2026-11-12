@@ -137,9 +137,12 @@ namespace TrayMixer
 
         void BuildDevicesMenu()
         {
-            foreach (ToolStripItem item in _devicesItem.DropDownItems)
-                item.Dispose();
+            // Disposing an item removes it from its menu, so take the old items out before disposing them.
+            var old = new ToolStripItem[_devicesItem.DropDownItems.Count];
+            _devicesItem.DropDownItems.CopyTo(old, 0);
             _devicesItem.DropDownItems.Clear();
+            foreach (ToolStripItem item in old)
+                item.Dispose();
             if (_snapshot == null || _snapshot.Devices.Count == 0)
             {
                 _devicesItem.DropDownItems.Add(new ToolStripMenuItem("No output devices") { Enabled = false });

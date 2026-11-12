@@ -13,7 +13,7 @@
     <Product>Tray Mixer</Product>
     <AssemblyTitle>Tray Mixer</AssemblyTitle>
     <Description>Tray volume mixer for every app, with separate control of Discord sound effects.</Description>
-    <Version>2.1.0</Version>
+    <Version>2.1.1</Version>
     <DebugType>none</DebugType>
     <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
